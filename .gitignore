@@ -129,3 +129,9 @@ logs
 log
 outputs
 .history
+
+# machine-specific files
+machine_spec/
+
+# data files
+data/

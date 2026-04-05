@@ -34,6 +34,23 @@ model:
   # Whether to enable loading a remote code model, default to False
   trust_remote_code: False
 
+# MIL reward model configuration
+mil:
+  # Whether to enable MIL reward model
+  enable: False
+
+  # MIL model architecture key, must exist in ARCHITECTURE_TO_MODEL_CLASS
+  architecture: ???
+
+  # Step separator used to split response into segments
+  step_separator: "\n\n"
+
+  # Segment score aggregation: average | min | last | document
+  score_aggregation_mode: average
+
+  # Default score for samples with no valid segments
+  empty_segment_default: 0.0
+
 # [Deprecated] Global micro batch size
 # will be deprecated, use micro_batch_size_per_gpu
 micro_batch_size: null

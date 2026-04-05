@@ -20,7 +20,16 @@ from verl.base_config import BaseConfig
 from .model import HFModelConfig
 from .rollout import RolloutConfig
 
-__all__ = ["SandboxFusionConfig", "RewardModelConfig"]
+__all__ = ["MilConfig", "SandboxFusionConfig", "RewardModelConfig"]
+
+
+@dataclass
+class MilConfig(BaseConfig):
+    enable: bool = False
+    architecture: str = ""
+    step_separator: str = "\n\n"
+    score_aggregation_mode: str = "average"
+    empty_segment_default: float = 0.0
 
 
 @dataclass
@@ -52,4 +61,5 @@ class RewardModelConfig(BaseConfig):
     # reward model args
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     model: HFModelConfig = field(default_factory=HFModelConfig)
+    mil: MilConfig = field(default_factory=MilConfig)
     sandbox_fusion: SandboxFusionConfig = field(default_factory=SandboxFusionConfig)

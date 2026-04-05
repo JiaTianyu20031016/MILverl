@@ -68,6 +68,11 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
+        # for using ray debugger
+        if "env_vars" not in runtime_env_kwargs:
+           runtime_env_kwargs["env_vars"] = {}
+        runtime_env_kwargs["env_vars"]["RAY_DEBUG"] = "1"
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
@@ -203,20 +208,25 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.reward_model.enable:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable"]:
-                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                    from verl.workers.fsdp_workers import RewardModelWorker
-                elif config.reward_model.strategy == "megatron":
-                    from verl.workers.megatron_workers import RewardModelWorker
-                else:
-                    raise NotImplementedError
-            elif use_legacy_worker_impl == "disable":
-                from verl.workers.roles import RewardModelWorker
-
-                print("Using new worker implementation")
+            if config.reward_model.mil.enable:
+                # use MIL model as reward model
+                from verl.workers.fsdp_workers import MILRewardModelWorker as RewardModelWorker
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                # fall back to original reward model worker implementation, which supports both fsdp and megatron strategy. 
+                use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+                if use_legacy_worker_impl in ["auto", "enable"]:
+                    if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+                        from verl.workers.fsdp_workers import RewardModelWorker
+                    elif config.reward_model.strategy == "megatron":
+                        from verl.workers.megatron_workers import RewardModelWorker
+                    else:
+                        raise NotImplementedError
+                elif use_legacy_worker_impl == "disable":
+                    from verl.workers.roles import RewardModelWorker
+
+                    print("Using new worker implementation")
+                else:
+                    raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
             self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             if config.reward_model.enable_resource_pool:
