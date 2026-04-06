@@ -2032,6 +2032,13 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             model_class = ARCHITECTURE_TO_MODEL_CLASS.get(config.mil.architecture, None)
             if model_class is None:
                 raise ValueError(f"Unsupported architecture '{config.mil.architecture}'. Supported architectures are: {list(ARCHITECTURE_TO_MODEL_CLASS.keys())}")
+            
+            _orig_param_new = torch.nn.Parameter.__new__
+            def _patched_param_new(cls, *args, **kwargs):
+                kwargs.pop('_is_hf_initialized', None)
+                return _orig_param_new(cls, *args, **kwargs)
+            torch.nn.Parameter.__new__ = staticmethod(_patched_param_new)
+            
             reward_module = model_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 trust_remote_code=trust_remote_code,
