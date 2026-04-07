@@ -30,6 +30,7 @@ class MilConfig(BaseConfig):
     step_separator: str = "\n\n"
     score_aggregation_mode: str = "average"
     empty_segment_default: float = 0.0
+    rule_based_reward_weight: float = 0.0
 
 
 @dataclass

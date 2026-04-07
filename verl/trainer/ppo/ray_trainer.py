@@ -1093,6 +1093,12 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
+                            metrics['reward/debug/mil_score_mean'] = reward_tensor.batch["mil_scores"].mean().item()
+                            metrics['reward/debug/rule_based_score_mean'] = reward_tensor.batch["rule_based_scores"].mean().item()
+                            rm_accuracy = (reward_tensor.batch["mil_scores"] > 0.5) == reward_tensor.batch["rule_based_scores"].bool()
+                            metrics['reward/debug/rm_accuracy'] = rm_accuracy.float().mean().item()
+                            metrics['reward/debug/rm_positive_accuracy'] = rm_accuracy[reward_tensor.batch["rule_based_scores"].bool()].float().mean().item()
+                            metrics['reward/debug/rm_negative_accuracy'] = rm_accuracy[~reward_tensor.batch["rule_based_scores"].bool()].float().mean().item()
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(

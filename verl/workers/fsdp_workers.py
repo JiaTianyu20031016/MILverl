@@ -2090,7 +2090,6 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        breakpoint()
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
@@ -2244,6 +2243,10 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
 
         def _get_document_sample(prompt, response, separator) -> DocumentSample:
             segment_texts = response.split(separator)
+            if len(segment_texts) == 1:
+                # may because the policy model use literal value as separator
+                repr_separator = repr(separator)[1:-1]
+                segment_texts = response.split(repr_separator)
             if segment_texts[-1] == "":
                 segment_texts = segment_texts[:-1]
             segments = [Segment(text=segment, label=0, positive_prob=0) for segment in segment_texts]
@@ -2264,7 +2267,7 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
                 try:
                     chat: list = list(data.non_tensor_batch["raw_prompt"][i])
                     assert len(chat) == 1 and chat[0]["role"] == "user", f"Only support single-turn user prompt, got {chat}"
-                    prompt = chat[0]["content"]
+                    raw_prompt = chat[0]["content"]
                 except Exception as e:
                     raise ValueError(f"Failed to extract prompt from raw_prompt. Please make sure raw_prompt is either a string or a list of chat messages with a single user message. Error: {e}")
 
@@ -2279,7 +2282,7 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             # remove bos and eos
             response = response.replace(src_tokenizer.eos_token, "")
 
-            document_samples.append(_get_document_sample(prompt, response, separator=self.config.mil.get("step_separator", "\n\n")))
+            document_samples.append(_get_document_sample(raw_prompt, response, separator=self.config.mil.get("step_separator", "\n\n")))
 
         # the maximum length is actually determined by the reward model itself
         max_length = self.config.get("max_length", src_max_length)
@@ -2336,7 +2339,19 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
 
         # # Support all hardwares
         # rm_data = rm_data.to(get_device_id())
+
         rm_dataloader = self._prepare_mil_dataloader(data)
+        from verl.utils.reward_score.math_reward import compute_score as compute_rule_based_reward
+        ground_truths = [
+            data.non_tensor_batch["reward_model"][i].get("ground_truth", None) for i in range(data.batch.batch_size[0])
+        ]
+        document_texts = []
+        for batch in rm_dataloader:
+            document_texts.extend(batch['document_texts'])
+        rule_based_scores = torch.tensor([
+            compute_rule_based_reward(document_text, ground_truth)
+            for document_text, ground_truth in zip(document_texts, ground_truths)
+        ], device=get_device_id(), dtype=torch.bfloat16)
 
         # perform forward computation
         with self.ulysses_sharding_manager:
@@ -2367,9 +2382,13 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 scores = scores[revert_indices]
 
-            token_level_scores = self._expand_to_token_level(data, scores)
+            token_level_scores = self._expand_to_token_level(data, scores + self.config.mil.get("rule_based_reward_weight", 0.0) * rule_based_scores)
             # Note that this is only the scores, may not be the final rewards used to train RL
-            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+            output = DataProto.from_dict(tensors={
+                "rm_scores": token_level_scores,
+                "rule_based_scores": rule_based_scores,
+                "mil_scores": scores,
+            })
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
