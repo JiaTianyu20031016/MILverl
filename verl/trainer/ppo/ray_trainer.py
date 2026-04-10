@@ -60,7 +60,6 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
-
 @dataclass
 class ResourcePoolManager:
     """
@@ -953,6 +952,161 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+
+    def split_steps(self, data):
+
+        import verl.utils.torch_functional as verl_F
+        from verl.utils.model import compute_position_id_with_mask
+        import json
+        from string import Template
+
+        split_steps_prompt = '''
+        You will be given a math problem and a solution. Your task is to split the solution into logical steps.
+
+        Strict requirements:
+        - Split the solution by inserting '[STEP]' before each step.
+        - If the original solution contains explicit step indicators (e.g., "Step 1:", "Step 2:"), you should follow those indicators to split the steps. If not, you should split the solution into a few logical steps based on the reasoning boundaries.
+        - The split solution should differs from the original solution only by the addition of '[STEP]' indicators, and should not contain any other modifications. Keep every character in the original solution as-is.
+
+        Example 1:
+        [Problem]
+        Calculate the sum of the first 5 natural numbers.
+
+        [Solution]
+        The first 5 natural numbers are 1, 2, 3, 4, and 5. We can calculate the sum by adding these numbers together: 1 + 2 + 3 + 4 + 5 = 15. Therefore, the sum of the first 5 natural numbers is \\boxed{{15}}.
+
+        [Your Output]
+        [STEP]The first 5 natural numbers are 1, 2, 3, 4, and 5. [STEP]We can calculate the sum by adding these numbers together: 1 + 2 + 3 + 4 + 5 = 15. [STEP]Therefore, the sum of the first 5 natural numbers is \\boxed{{15}}.
+
+        Example 2:
+        [Problem]
+        Prove that the square root of 2 is irrational.
+
+        [Solution]
+        1. Assume for the sake of contradiction that \\sqrt{2} is rational. Then we can express it as a fraction \\frac{a}{b}, where a and b are integers with no common factors (i.e., the fraction is in lowest terms). 
+        2. Squaring both sides of the equation gives us 2 = \\frac{a^2}{b^2}, which implies that a must be even (since a^2 is divisible by 2). Therefore, we can write a as 2k for some integer k.
+        3. Substituting a = 2k back into the equation gives us 2 = \\frac{(2k)^2}{b^2} = \\frac{4k^2}{b^2}, which simplifies to b^2 = 2k^2. This implies that b must also be even (since b^2 is divisible by 2).
+        4. However, if both a and b are even, then they have a common factor of 2, which contradicts our initial assumption that \\frac{a}{b} is in lowest terms. 
+        5. Therefore, our assumption that \\sqrt{2} is rational must be false, and we conclude that \\sqrt{2} is irrational.
+
+        [Your Output]
+        [STEP]1. Assume for the sake of contradiction that \\sqrt{2} is rational. Then we can express it as a fraction \\frac{a}{b}, where a and b are integers with no common factors (i.e., the fraction is in lowest terms). 
+        [STEP]2. Squaring both sides of the equation gives us 2 = \\frac{a^2}{b^2}, which implies that a must be even (since a^2 is divisible by 2). Therefore, we can write a as 2k for some integer k. 
+        [STEP]3. Substituting a = 2k back into the equation gives us 2 = \\frac{(2k)^2}{b^2} = \\frac{4k^2}{b^2}, which simplifies to b^2 = 2k^2. This implies that b must also be even (since b^2 is divisible by 2). 
+        [STEP]4. However, if both a and b are even, then they have a common factor of 2, which contradicts our initial assumption that \\frac{a}{b} is in lowest terms. 
+        [STEP]5. Therefore, our assumption that \\sqrt{2} is rational must be false, and we conclude that \\sqrt{2} is irrational.
+
+        Now you split the following solution:
+        [Problem]
+        $prompt
+
+        [Solution]
+        $response
+
+        [Your Output]
+        '''
+        max_prompt_length = data.batch["prompts"].shape[1]
+        
+        outputs = {
+            "input_ids": [],
+            "attention_mask": [],
+            "position_ids": [],
+            "raw_prompt": [],
+            "raw_response": [],
+            "uid": data.non_tensor_batch['uid']
+        }
+        for i in range(data.batch.batch_size[0]):
+            # extract raw prompt
+            question = data.non_tensor_batch["extra_info"][i].get("raw_prompt", None)
+            if question is None:
+                try:
+                    chat: list = list(data.non_tensor_batch["raw_prompt"][i])
+                    assert len(chat) == 1 and chat[0]["role"] == "user", f"Only support single-turn user prompt, got {chat}"
+                    question = chat[0]["content"]
+                except Exception as e:
+                    raise ValueError(f"Failed to extract prompt from raw_prompt. Please make sure raw_prompt is either a string or a list of chat messages with a single user message. Error: {e}")
+
+            # extract response
+            response_ids = data.batch["responses"][i]
+            response_length = response_ids.shape[-1]
+            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            response = self.tokenizer.decode(valid_response_ids)
+            # remove bos and eos
+            response = response.replace(self.tokenizer.eos_token, "")
+
+            # build prompt and tokenize
+            prompt = Template(split_steps_prompt).substitute(prompt=question, response=response)
+            messages = [
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ]
+            messages = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            model_inputs = self.tokenizer(messages, return_tensors="pt", add_special_tokens=False)
+            input_ids = model_inputs.pop("input_ids")
+            attention_mask = model_inputs.pop("attention_mask")
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation='left',
+            )
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+            outputs["input_ids"].append(input_ids[0])
+            outputs["attention_mask"].append(attention_mask[0])
+            outputs["position_ids"].append(position_ids[0])
+            outputs["raw_prompt"].append(prompt)
+            outputs["raw_response"].append(response)
+
+        outputs["input_ids"] = torch.stack(outputs["input_ids"])
+        outputs["attention_mask"] = torch.stack(outputs["attention_mask"])
+        outputs["position_ids"] = torch.stack(outputs["position_ids"])
+        outputs["raw_prompt"] = np.array(outputs["raw_prompt"], dtype=object)
+        outputs["raw_response"] = np.array(outputs["raw_response"], dtype=object)
+        batch = DataProto.from_single_dict(outputs)
+        
+        gen_batch = self._get_gen_batch(batch)
+        gen_batch.meta_info["global_steps"] = self.global_steps
+        if not self.async_rollout_mode:
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+        else:
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        gen_batch_output.meta_info.pop("timing", None)
+        batch = batch.union(gen_batch_output)
+
+        steps_list = []
+        for i in range(batch.batch.batch_size[0]):
+            # extract response
+            response_ids = batch.batch["responses"][i]
+            response_length = response_ids.shape[-1]
+            valid_response_length = batch.batch["attention_mask"][i][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            response = self.tokenizer.decode(valid_response_ids)
+            # remove bos and eos
+            response = response.replace(self.tokenizer.eos_token, "")
+
+            steps = response.split("[STEP]")
+            if steps[0].strip() == "":
+                steps = steps[1:]
+            if steps[-1].strip() == "":
+                steps = steps[:-1]
+            steps_list.append(steps)
+        
+        data.non_tensor_batch['steps'] = np.array(steps_list, dtype=object)
+        return data
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1076,6 +1230,11 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # split steps by prompting LLM
+                    # with marked_timer("split_steps", timing_raw, color="red"):
+                    #     batch = self.split_steps(batch)
+                    
+                    # calculate response mask
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

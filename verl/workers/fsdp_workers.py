@@ -2115,8 +2115,12 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             scores = document_scores
         else:
             raise ValueError(f"Unsupported mode: {mode}")
-    
-        return scores
+
+        raw_scores = []
+        for i in range(document_scores.size(0)):
+            valid_segment_scores = segment_scores[i][segment_valid_mask[i]].tolist()
+            raw_scores.append(valid_segment_scores)
+        return scores, raw_scores
 
     def _forward_micro_batch(self, micro_batch):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -2201,7 +2205,7 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             }
 
             outputs = self.reward_module(eval=True, **filtered_micro_batch)
-            rm_score_valid = self._compute_sequence_scores(
+            rm_score_valid, _ = self._compute_sequence_scores(
                 inputs=filtered_micro_batch,
                 outputs=outputs,
                 mode=self.config.mil.get("score_aggregation_mode", "average"),
@@ -2229,10 +2233,12 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
         return token_level_scores
 
     def _prepare_mil_dataloader(self, data: DataProto):
+        
         from MILdata.dataset_common import DocumentSample, Segment, TokenizedDocumentDataset
         from MILdata.collator import MILDataCollator
         from torch.utils.data import DataLoader
         from MILmodel.mil_model_for_prm import DPOBaselineModelforPRM
+        import re
 
         src_max_length = data.batch["attention_mask"].shape[-1]
 
@@ -2241,15 +2247,20 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
 
         document_samples = []
 
-        def _get_document_sample(prompt, response, separator) -> DocumentSample:
-            segment_texts = response.split(separator)
-            if len(segment_texts) == 1:
-                # may because the policy model use literal value as separator
-                repr_separator = repr(separator)[1:-1]
-                segment_texts = response.split(repr_separator)
-            if segment_texts[-1] == "":
-                segment_texts = segment_texts[:-1]
-            segments = [Segment(text=segment, label=0, positive_prob=0) for segment in segment_texts]
+        def _get_document_sample(prompt, response, separator, step_list=None) -> DocumentSample:
+            # segment_texts = response.split(separator)
+            # if len(segment_texts) == 1:
+            #     # may because the policy model use literal value as separator
+            #     repr_separator = repr(separator)[1:-1]
+            #     segment_texts = response.split(repr_separator)
+            # if segment_texts[-1] == "":
+            #     segment_texts = segment_texts[:-1]
+
+            # each step begins with 'Step n:'
+            segment_texts = step_list or re.split(r"(?i)\bstep\s*\d+\s*:\s*", response)
+            if segment_texts[0].strip() == "":
+                segment_texts = segment_texts[1:]
+            segments = [Segment(text=segment.strip(), label=0, positive_prob=0) for segment in segment_texts]
             return DocumentSample(
                 doc_id='',
                 rating=0,
@@ -2282,7 +2293,14 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             # remove bos and eos
             response = response.replace(src_tokenizer.eos_token, "")
 
-            document_samples.append(_get_document_sample(raw_prompt, response, separator=self.config.mil.get("step_separator", "\n\n")))
+            document_samples.append(
+                _get_document_sample(
+                    raw_prompt, 
+                    response, 
+                    separator=self.config.mil.get("step_separator", "\n\n"),
+                    step_list=data.non_tensor_batch["step_list"][i] if "step_list" in data.non_tensor_batch else None
+                )
+            )
 
         # the maximum length is actually determined by the reward model itself
         max_length = self.config.get("max_length", src_max_length)
