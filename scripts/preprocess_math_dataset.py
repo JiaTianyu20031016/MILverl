@@ -59,7 +59,7 @@ if __name__ == "__main__":
     test_dataset = dataset["test"]
 
     instruction_following = (
-        f"Let's think step by step. Start the n-th step with 'Step n: ', and output the final answer within \\boxed{{}}."
+        f"Let's think step by step, and output the final answer within \\boxed{{}}."
     )
 
     # add a row to each data item that represents a unique id

@@ -1252,12 +1252,125 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-                            metrics['reward/debug/mil_score_mean'] = reward_tensor.batch["mil_scores"].mean().item()
-                            metrics['reward/debug/rule_based_score_mean'] = reward_tensor.batch["rule_based_scores"].mean().item()
-                            rm_accuracy = (reward_tensor.batch["mil_scores"] > 0.5) == reward_tensor.batch["rule_based_scores"].bool()
-                            metrics['reward/debug/rm_accuracy'] = rm_accuracy.float().mean().item()
-                            metrics['reward/debug/rm_positive_accuracy'] = rm_accuracy[reward_tensor.batch["rule_based_scores"].bool()].float().mean().item()
-                            metrics['reward/debug/rm_negative_accuracy'] = rm_accuracy[~reward_tensor.batch["rule_based_scores"].bool()].float().mean().item()
+                            metrics['debug/mil/mean'] = reward_tensor.batch["mil_scores"].mean().item()
+                            metrics['debug/rule_based_score/mean'] = reward_tensor.batch["rule_based_scores"].mean().item()
+                            # some metrics for debugging
+                            def _binary_auc(scores_: torch.Tensor, labels_: torch.Tensor) -> float:
+                                scores_cpu = scores_.detach().flatten().float().cpu()
+                                labels_cpu = labels_.detach().flatten().float().cpu()
+                                n_pos = int(labels_cpu.sum().item())
+                                n = labels_cpu.numel()
+                                n_neg = n - n_pos
+                                if n_pos == 0 or n_neg == 0:
+                                    return float("nan")
+
+                                sorted_scores, sorted_idx = torch.sort(scores_cpu)
+                                sorted_labels = labels_cpu[sorted_idx]
+
+                                unique_scores, counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+                                ranks = torch.empty_like(sorted_scores, dtype=torch.float32)
+                                start = 0
+                                for count in counts.tolist():
+                                    end = start + count
+                                    avg_rank = (start + 1 + end) / 2.0
+                                    ranks[start:end] = avg_rank
+                                    start = end
+
+                                sum_ranks_pos = ranks[sorted_labels == 1].sum().item()
+                                auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+                                return float(auc)
+
+                            def _binary_auprc(scores_: torch.Tensor, labels_: torch.Tensor) -> float:
+                                scores_cpu = scores_.detach().flatten().float().cpu()
+                                labels_cpu = labels_.detach().flatten().float().cpu()
+                                n_pos = int(labels_cpu.sum().item())
+                                if n_pos == 0:
+                                    return float("nan")
+
+                                sorted_scores, sorted_idx = torch.sort(scores_cpu, descending=True)
+                                sorted_labels = labels_cpu[sorted_idx]
+
+                                tp = torch.cumsum(sorted_labels, dim=0)
+                                fp = torch.cumsum(1 - sorted_labels, dim=0)
+                                precision = tp / (tp + fp + 1e-12)
+                                recall = tp / n_pos
+
+                                unique_scores, counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+                                end_indices = torch.cumsum(counts, dim=0) - 1
+                                prec_at = precision[end_indices]
+                                rec_at = recall[end_indices]
+
+                                auc_pr = torch.trapz(prec_at, rec_at).item()
+                                return float(auc_pr)
+
+                            def _brier_score(scores_: torch.Tensor, labels_: torch.Tensor) -> float:
+                                scores_cpu = scores_.detach().flatten().float().cpu()
+                                labels_cpu = labels_.detach().flatten().float().cpu()
+                                return float(torch.mean((scores_cpu - labels_cpu) ** 2).item())
+
+                            def _point_biserial(scores_: torch.Tensor, labels_: torch.Tensor) -> float:
+                                scores_cpu = scores_.detach().flatten().float().cpu()
+                                labels_cpu = labels_.detach().flatten().float().cpu()
+                                if labels_cpu.std().item() == 0 or scores_cpu.std().item() == 0:
+                                    return float("nan")
+                                return float(torch.corrcoef(torch.stack([scores_cpu, labels_cpu]))[0, 1].item())
+
+                            def _grouped_metrics(scores_: torch.Tensor, labels_: torch.Tensor, mask_: torch.Tensor, n: int):
+                                scores_cpu = scores_.detach().float().cpu()
+                                labels_cpu = labels_.detach().float().cpu()
+                                mask_cpu = mask_.detach().bool().cpu()
+
+                                scores_g = scores_cpu.view(-1, n)
+                                labels_g = labels_cpu.view(-1, n)
+                                mask_g = mask_cpu.view(-1, n)
+
+                                auc_vals = []
+                                auprc_vals = []
+                                brier_vals = []
+                                for i in range(scores_g.size(0)):
+                                    sel = mask_g[i]
+                                    if not sel.any():
+                                        continue
+                                    s_i = scores_g[i][sel]
+                                    y_i = labels_g[i][sel]
+                                    if y_i.sum().item() in [0, y_i.numel()]:
+                                        auc_vals.append(float("nan"))
+                                        auprc_vals.append(float("nan"))
+                                    else:
+                                        auc_vals.append(_binary_auc(s_i, y_i))
+                                        auprc_vals.append(_binary_auprc(s_i, y_i))
+                                    brier_vals.append(_brier_score(s_i, y_i))
+
+                                def _nanmean(vals):
+                                    vals = [v for v in vals if not (isinstance(v, float) and np.isnan(v))]
+                                    if len(vals) == 0:
+                                        return float("nan")
+                                    return float(np.mean(vals))
+
+                                return _nanmean(auc_vals), _nanmean(auprc_vals), _nanmean(brier_vals)
+
+                            scores = reward_tensor.batch["mil_scores"]
+                            scores_var = torch.var(scores.view((-1, self.config.actor_rollout_ref.rollout.n)), dim=-1).mean().item()
+                            rule_based_scores = reward_tensor.batch["rule_based_scores"]
+                            labels = (rule_based_scores > 0).float()
+                            valid_mask = ~torch.as_tensor(batch.non_tensor_batch['truncated'], device=labels.device) if 'truncated' in batch.non_tensor_batch else torch.ones_like(labels, dtype=torch.bool)
+
+                            global_auc = _binary_auc(scores, labels)
+                            global_auprc = _binary_auprc(scores, labels)
+                            global_brier = _brier_score(scores, labels)
+                            global_corr = _point_biserial(scores, labels)
+
+                            n_rollout = self.config.actor_rollout_ref.rollout.n
+                            grouped_auc, grouped_auprc, grouped_brier = _grouped_metrics(scores, labels, valid_mask, n_rollout)
+
+                            metrics['debug/mil/var'] = scores_var
+                            metrics['debug/mil/auc_global'] = global_auc
+                            metrics['debug/mil/auprc_global'] = global_auprc
+                            metrics['debug/mil/brier_global'] = global_brier
+                            metrics['debug/mil/pointbiserial_global'] = global_corr
+                            metrics['debug/mil/auc_group_mean'] = grouped_auc
+                            metrics['debug/mil/auprc_group_mean'] = grouped_auprc
+                            metrics['debug/mil/brier_group_mean'] = grouped_brier
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(

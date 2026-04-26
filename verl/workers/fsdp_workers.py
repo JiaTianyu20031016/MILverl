@@ -2103,6 +2103,15 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             valid_segment_num = segment_valid_mask.sum(dim=-1)
             valid_segment_num = torch.clamp(valid_segment_num, min=1)
             scores = (segment_scores * segment_valid_mask).sum(dim=-1) / valid_segment_num
+        elif mode == 'auc':
+            # area under the min-curve of segment scores
+            segment_scores[~segment_valid_mask] = torch.inf  # set invalid segments to a large value
+            min_segment_scores, _ = torch.cummin(segment_scores, dim=-1)
+            valid_segment_num = segment_valid_mask.sum(dim=-1)
+            valid_segment_num = torch.clamp(valid_segment_num, min=1)
+            scores = (min_segment_scores * segment_valid_mask).sum(dim=-1) / valid_segment_num
+        elif mode == 'sum':
+            scores = (segment_scores * segment_valid_mask).sum(dim=-1)
         elif mode == 'min':
             segment_scores[~segment_valid_mask] = torch.inf  # set invalid segments to a large value
             scores, _ = segment_scores.min(dim=-1)
@@ -2196,8 +2205,9 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
                 device=segment_mask.device,
                 dtype=torch.bfloat16,
             )
+            rm_raw_scores = np.empty(batch_size, dtype=object)
             if not valid_samples.any():
-                return rm_score
+                return rm_score, rm_raw_scores
 
             filtered_micro_batch = {
                 key: (value[valid_samples] if torch.is_tensor(value) and value.size(0) == batch_size else value)
@@ -2205,15 +2215,17 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
             }
 
             outputs = self.reward_module(eval=True, **filtered_micro_batch)
-            rm_score_valid, _ = self._compute_sequence_scores(
+            rm_score_valid, rm_raw_scores_valid = self._compute_sequence_scores(
                 inputs=filtered_micro_batch,
                 outputs=outputs,
                 mode=self.config.mil.get("score_aggregation_mode", "average"),
             )
             rm_score = rm_score.to(rm_score_valid.dtype)
             rm_score[valid_samples] = rm_score_valid
+            rm_raw_scores_valid = np.fromiter(rm_raw_scores_valid, dtype=object)
+            rm_raw_scores[valid_samples.cpu().numpy()] = rm_raw_scores_valid
 
-            return rm_score
+            return rm_score, rm_raw_scores
 
     def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor):
         batch_size = data.batch.batch_size[0]
@@ -2387,11 +2399,14 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
                     }
                     for batch in rm_dataloader
                 ]
-            output = []
+            rm_score_list = []
+            rm_raw_scores_list = []
             for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
-                output.append(rm_score)
-            scores = torch.cat(output, dim=0)  # (batch_size)
+                rm_score, rm_raw_scores = self._forward_micro_batch(micro_batch)
+                rm_score_list.append(rm_score)
+                rm_raw_scores_list.append(rm_raw_scores)
+            scores = torch.cat(rm_score_list, dim=0)  # (batch_size)
+            raw_scores = np.concatenate(rm_raw_scores_list, axis=0)  # (batch_size,)
 
             if use_dynamic_bsz:
                 raise NotImplementedError("Dynamic batch size is not implemented for MILRewardModelWorker yet")
@@ -2402,10 +2417,11 @@ class MILRewardModelWorker(Worker, DistProfilerExtension):
 
             token_level_scores = self._expand_to_token_level(data, scores + self.config.mil.get("rule_based_reward_weight", 0.0) * rule_based_scores)
             # Note that this is only the scores, may not be the final rewards used to train RL
-            output = DataProto.from_dict(tensors={
+            output = DataProto.from_single_dict({
                 "rm_scores": token_level_scores,
                 "rule_based_scores": rule_based_scores,
                 "mil_scores": scores,
+                "mil_raw_scores": raw_scores,
             })
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
